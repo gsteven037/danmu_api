@@ -1,4 +1,4 @@
-<div align="center">
+<img width="1873" height="596" alt="图片" src="https://github.com/user-attachments/assets/cfd343d0-27f2-40b3-ac12-d3c376fa6f26" /><div align="center">
   <img src="https://i.mji.rip/2025/09/27/eedc7b701c0fa5c1f7c175b22f441ad9.jpeg" alt="Clash" width="128" style="border-radius: 16px;" />
 </div>
 
@@ -231,7 +231,7 @@ LogVar 弹幕 API 服务器
 ### 一键部署
 点击以下按钮即可将项目快速部署到 Vercel：
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/huangxd-/danmu_api&project-name=danmu_api&repository-name=danmu_api)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/gsteven037/danmu_api&project-name=danmu_api&repository-name=danmu_api)
 
 **注意**：请将按钮链接中的 `https://github.com/huangxd-/danmu_api` 替换为你的实际 Git 仓库地址。编辑 `README.md` 并更新链接后，推送到仓库，点击按钮即可自动克隆和部署。
 - **设置环境变量**：部署后，在 Vercel 仪表板中：
