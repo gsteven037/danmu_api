@@ -5,6 +5,7 @@ import { httpGet, httpPost } from "../utils/http-util.js";
 import { addAnime, removeEarliestAnime } from "../utils/cache-util.js";
 import { simplized } from "../utils/zh-util.js";
 import { SegmentListResponse } from '../models/dandan-model.js';
+import { titleMatches } from "../utils/common-util.js";
 
 // =====================
 // 获取Animeko弹幕(https://github.com/open-ani/animeko)
@@ -29,54 +30,82 @@ export default class AnimekoSource extends BaseSource {
 
   /**
    * 搜索动画条目
-   * 使用 Bangumi V0 POST 接口进行搜索，并进行后置过滤和关系检测
+   * 使用 Bangumi V0 POST 接口进行搜索，支持偏移翻页、结果过滤及关系检测
    * @param {string} keyword 搜索关键词
    * @returns {Promise<Array>} 转换后的搜索结果列表
    */
   async search(keyword) {
     try {
-      log("info", `[Animeko] 开始搜索 (V0): ${keyword}`);
+      // 标准化函数
+      const searchKeyword = keyword.replace(/[._]/g, ' ').replace(/\s+/g, ' ').trim();
+      log("info", `[Animeko] 开始搜索 (V0): ${searchKeyword}`);
 
-      const searchUrl = `https://api.bgm.tv/v0/search/subjects?limit=5`;
-      
-      const payload = {
-        keyword: keyword,
-        filter: {
-          type: [2] // 2 代表动画类型
+      let allFilteredResults = [];
+      let offset = 0;
+      const limit = 20;
+
+      while (true) {
+        const searchUrl = `https://api.bgm.tv/v0/search/subjects?limit=${limit}&offset=${offset}`;
+        
+        const payload = {
+          keyword: searchKeyword,
+          filter: {
+            type: [2] // 2 代表动画类型
+          }
+        };
+
+        const resp = await httpPost(searchUrl, JSON.stringify(payload), {
+          headers: this.headers
+        });
+
+        if (!resp || !resp.data) {
+          log("info", `[Animeko] 搜索请求失败或无数据返回 (offset: ${offset})`);
+          break;
         }
-      };
 
-      const resp = await httpPost(searchUrl, JSON.stringify(payload), {
-        headers: this.headers
-      });
+        const currentBatch = resp.data.data || [];
 
-      if (!resp || !resp.data) {
-        log("info", "[Animeko] 搜索请求失败或无数据返回");
-        return [];
+        if (currentBatch.length === 0) {
+          break;
+        }
+
+        // 执行结果相关度过滤 (剔除强大的模糊搜索带来的杂项)
+        const filteredBatch = this.filterSearchResults(currentBatch, keyword);
+        
+        if (filteredBatch.length > 0) {
+          allFilteredResults = allFilteredResults.concat(filteredBatch);
+        }
+
+        // 核心分页判断逻辑
+        if (filteredBatch.length < limit) {
+          log("info", `[Animeko] 过滤后当前批次剩 ${filteredBatch.length} 个结果，停止翻页`);
+          break;
+        }
+
+        offset += limit;
+
+        // 安全熔断：限制最大翻页次数（例如获取前 60 条）防止特殊情况下的无意义消耗
+        if (offset >= 60) {
+          log("warn", `[Animeko] 搜索翻页达到安全上限(60)，强制停止`);
+          break;
+        }
       }
 
-      let resultsList = resp.data.data || [];
-
-      if (resultsList.length === 0) {
-        log("info", "[Animeko] 未找到相关条目");
-        return [];
-      }
-
-      // 执行结果相关度过滤
-      resultsList = this.filterSearchResults(resultsList, keyword);
-
-      if (resultsList.length === 0) {
+      if (allFilteredResults.length === 0) {
         log("info", "[Animeko] 过滤后无匹配结果");
         return [];
       }
 
+      // 跨页合并后，为了防止多页触发同样的“智能季度匹配兜底”导致重复，这里做一次 ID 去重
+      let uniqueResults = Array.from(new Map(allFilteredResults.map(item => [item.id, item])).values());
+
       // 检测条目间关系 (如处理续篇、剧场版等层级关系)
-      if (resultsList.length > 1) {
-        resultsList = await this.checkRelationsAndModifyTitles(resultsList);
+      if (uniqueResults.length > 1) {
+        uniqueResults = await this.checkRelationsAndModifyTitles(uniqueResults);
       }
       
-      log("info", `[Animeko] 搜索完成，找到 ${resultsList.length} 个有效结果`);
-      return this.transformResults(resultsList);
+      log("info", `[Animeko] 搜索完成，共找到 ${uniqueResults.length} 个有效结果`);
+      return this.transformResults(uniqueResults);
     } catch (error) {
       log("error", "[Animeko] Search error:", {
         message: error.message,
@@ -89,75 +118,30 @@ export default class AnimekoSource extends BaseSource {
 
   /**
    * 过滤搜索结果
-   * 计算关键词与标题（含中文名、原名及别名）的相似度，剔除低相关度结果
+   * 利用公共方法对主标题和别名进行匹配校验
    * @param {Array} list 原始 API 返回结果列表
    * @param {string} keyword 用户搜索关键词
    * @returns {Array} 过滤后的结果列表
    */
   filterSearchResults(list, keyword) {
-    const threshold = 0.4; // 相似度阈值
-    const normalizedKeyword = simplized(keyword).toLowerCase().trim();
-
     return list.filter(item => {
-      // 收集所有可能的标题用于比对
-      const titles = new Set();
-      if (item.name) titles.add(item.name);
-      if (item.name_cn) titles.add(item.name_cn);
+      const titles = [item.name, item.name_cn];
 
-      // 解析 infobox 获取更多别名信息
+      // 提取 infobox 中的别名和中文名扩充对比池
       if (item.infobox && Array.isArray(item.infobox)) {
         item.infobox.forEach(info => {
           if (info.key === '别名' && Array.isArray(info.value)) {
-            info.value.forEach(v => { if(v.v) titles.add(v.v); });
+            info.value.forEach(v => { if (v && v.v) titles.push(v.v); });
           }
           if (info.key === '中文名' && typeof info.value === 'string') {
-            titles.add(info.value);
+            titles.push(info.value);
           }
         });
       }
 
-      // 计算最高相似度得分
-      let maxScore = 0;
-      for (const t of titles) {
-        const normalizedTitle = simplized(t).toLowerCase().trim();
-        const score = this.calculateSimilarity(normalizedKeyword, normalizedTitle);
-        if (score > maxScore) maxScore = score;
-      }
-
-      return maxScore >= threshold;
+      // 只要主标题、中文名或任一别名符合匹配条件，即保留该条目
+      return titles.some(t => t && titleMatches(t, keyword));
     });
-  }
-
-  /**
-   * 计算字符串相似度
-   * 结合包含关系与编辑距离算法
-   * @param {string} s1 字符串1
-   * @param {string} s2 字符串2
-   * @returns {number} 相似度得分 (0.0 - 1.0)
-   */
-  calculateSimilarity(s1, s2) {
-    if (!s1 || !s2) return 0;
-    if (s1 === s2) return 1.0;
-    if (s1.includes(s2) || s2.includes(s1)) {
-      const lenRatio = Math.min(s1.length, s2.length) / Math.max(s1.length, s2.length);
-      return 0.8 + (lenRatio * 0.2); 
-    }
-    
-    // Levenshtein 距离计算
-    const len1 = s1.length;
-    const len2 = s2.length;
-    const matrix = [];
-    for (let i = 0; i <= len1; i++) matrix[i] = [i];
-    for (let j = 0; j <= len2; j++) matrix[0][j] = j;
-    for (let i = 1; i <= len1; i++) {
-      for (let j = 1; j <= len2; j++) {
-        const cost = s1.charAt(i - 1) === s2.charAt(j - 1) ? 0 : 1;
-        matrix[i][j] = Math.min(matrix[i-1][j]+1, matrix[i][j-1]+1, matrix[i-1][j-1]+cost);
-      }
-    }
-    const distance = matrix[len1][len2];
-    const maxLength = Math.max(len1, len2);
-    return maxLength === 0 ? 1.0 : 1.0 - (distance / maxLength);
   }
 
   /**
@@ -276,12 +260,41 @@ export default class AnimekoSource extends BaseSource {
         }
       }
 
+      // 识别 3D 与 2D 标签并追加至类型描述
+      let is3D = false;
+      let is2D = false;
+      if (item.tags && Array.isArray(item.tags)) {
+          item.tags.forEach(tag => {
+              if (tag.name === '3D') is3D = true;
+              if (tag.name === '2D') is2D = true;
+          });
+      }
+      if (is3D) typeDesc = "3D" + typeDesc;
+      else if (is2D) typeDesc = "2D" + typeDesc;
+
       const titleSuffix = item._relation_mark ? ` ${item._relation_mark}` : "";
+
+      // 提取别名列表 (用于合并工具进行模糊匹配)
+      const aliases = [];
+      if (item.infobox && Array.isArray(item.infobox)) {
+          item.infobox.forEach(info => {
+              if (info.key === '别名' && Array.isArray(info.value)) {
+                  info.value.forEach(v => {
+                      if (v && v.v) aliases.push(v.v);
+                  });
+              }
+          });
+      }
+      // 将中文名也作为别名的一种补充，防止 name 字段是日文而 name_cn 未被命中的情况
+      if (item.name_cn && item.name_cn !== item.name) {
+          aliases.push(item.name_cn);
+      }
       
       return {
         id: item.id,
         name: item.name,
         name_cn: (item.name_cn || item.name) + titleSuffix,
+        aliases: aliases,
         images: item.images,
         air_date: item.date, 
         score: item.score,
@@ -292,28 +305,72 @@ export default class AnimekoSource extends BaseSource {
 
   /**
    * 获取剧集列表
+   * Bangumi API 限制单次 limit=200，需循环获取完整列表
    * @param {number} subjectId 条目 ID
    * @returns {Promise<Array>} 剧集数组
    */
   async getEpisodes(subjectId) {
-    try {
-      const resp = await httpGet(`https://api.bgm.tv/v0/episodes?subject_id=${subjectId}`, {
-        headers: this.headers,
-      });
+    let allEpisodes = [];
+    let offset = 0;
+    const limit = 200;
 
-      if (!resp || !resp.data) {
-        log("info", `[Animeko] Subject ${subjectId} 无剧集数据`);
-        return [];
+    try {
+      while (true) {
+        // 构造分页 URL
+        const url = `https://api.bgm.tv/v0/episodes?subject_id=${subjectId}&limit=${limit}&offset=${offset}`;
+        
+        const resp = await httpGet(url, {
+          headers: this.headers,
+        });
+
+        // 1. 结构校验：确保 resp.data.data 存在且为数组
+        // 对应您的 JSON: resp.data 存在，resp.data.data 是 [] (数组)，校验通过
+        if (!resp || !resp.data || !Array.isArray(resp.data.data)) {
+          if (offset === 0) {
+             log("info", `[Animeko] Subject ${subjectId} 无剧集数据或响应异常`);
+          }
+          break;
+        }
+
+        const currentBatch = resp.data.data;
+
+        // 2. 空数据校验：如果没有数据，停止
+        // 对应您的 JSON: data 为 []，length 为 0，在此处 break 退出
+        if (currentBatch.length === 0) {
+          break;
+        }
+
+        // 3. 合并数据
+        allEpisodes = allEpisodes.concat(currentBatch);
+        
+        // 打印进度日志
+        if (currentBatch.length === limit) {
+           log("info", `[Animeko] ID:${subjectId} 正加载更多剧集 (当前已获: ${allEpisodes.length})`);
+        }
+
+        // 4. 判断是否还有下一页
+        // 如果当前获取的数量少于限制数量 (例如获取了 2 个，而 limit 是 200)，说明是最后一页
+        if (currentBatch.length < limit) {
+          break;
+        }
+
+        // 5. 准备下一页
+        offset += limit;
+
+        // 6. 安全熔断：防止API异常导致死循环
+        if (offset > 1600) {
+            log("warn", `[Animeko] ID:${subjectId} 剧集数量超过安全限制(1600)，停止翻页`);
+            break;
+        }
       }
 
-      const body = resp.data;
-      if (Array.isArray(body.data)) return body.data;
-      
-      return [];
+      return allEpisodes;
+
     } catch (error) {
       log("error", "[Animeko] GetEpisodes error:", {
         message: error.message,
-        id: subjectId
+        id: subjectId,
+        offset: offset
       });
       return [];
     }
@@ -325,7 +382,7 @@ export default class AnimekoSource extends BaseSource {
    * @param {string} queryTitle 原始查询标题
    * @param {Array} curAnimes 当前缓存的番剧列表
    */
-  async handleAnimes(sourceAnimes, queryTitle, curAnimes) {
+  async handleAnimes(sourceAnimes, queryTitle, curAnimes, detailStore = null) {
     const tmpAnimes = [];
 
     if (!sourceAnimes || !Array.isArray(sourceAnimes)) {
@@ -352,7 +409,7 @@ export default class AnimekoSource extends BaseSource {
 
               const epNum = ep.sort || ep.ep; 
               const epName = ep.name_cn || ep.name || "";
-              const fullTitle = `EP${epNum} ${epName}`.trim();
+              const fullTitle = `第${epNum}话 ${epName}`.trim();
               
               links.push({
                 "name": `${epNum}`, 
@@ -369,6 +426,7 @@ export default class AnimekoSource extends BaseSource {
               animeId: anime.id,
               bangumiId: String(anime.id),
               animeTitle: `${anime.name_cn || anime.name}(${yearStr})【${anime.typeDescription || '动漫'}】from animeko`,
+              aliases: anime.aliases || [],
               type: "动漫",
               typeDescription: anime.typeDescription || "动漫",
               imageUrl: anime.images ? (anime.images.common || anime.images.large) : "",
@@ -380,7 +438,7 @@ export default class AnimekoSource extends BaseSource {
             };
 
             tmpAnimes.push(transformedAnime);
-            addAnime({...transformedAnime, links: links});
+            addAnime({...transformedAnime, links: links}, detailStore);
 
             if (globals.animes.length > globals.MAX_ANIMES) removeEarliestAnime();
           }
@@ -396,28 +454,68 @@ export default class AnimekoSource extends BaseSource {
 
   /**
    * 获取完整弹幕列表
-   * 支持传入纯数字ID或完整URL
+   * 支持自动降级：Global -> CN
    * @param {string} episodeId 剧集 ID 或 完整 API URL
    * @returns {Promise<Array>} 弹幕数组
    */
   async getEpisodeDanmu(episodeId) {
-    try {
-      // 兼容分片请求传递过来的完整 URL
-      const url = episodeId.startsWith('http') 
-        ? episodeId 
-        : `https://danmaku-global.myani.org/v1/danmaku/${episodeId}`;
-        // 目前使用的服务器是全球区域的，备用大陆区域：https://danmaku-cn.myani.org
-
-      const resp = await httpGet(url, { headers: this.headers });
-
-      if (!resp || !resp.data) return [];
-      const body = resp.data;
-      if (body.danmakuList) return body.danmakuList;
-      return [];
-    } catch (error) {
-      log("error", "[Animeko] GetDanmu error:", { message: error.message, url: episodeId });
+    // 1. 提取真实 ID
+    // 兼容分片请求传递过来的完整 URL 或 纯 ID
+    let realId = String(episodeId).trim();
+    
+    // 如果是完整 URL (包含 /)，尝试提取最后一部分
+    if (realId.includes('/')) {
+      const parts = realId.split('/');
+      realId = parts[parts.length - 1]; 
+    }
+    
+    // 去除可能存在的 URL 参数干扰 (例如 ?v=1)
+    if (realId.includes('?')) {
+      realId = realId.split('?')[0];
+    }
+    
+    if (!realId) {
+      log("error", "[Animeko] 无效的 episodeId");
       return [];
     }
+
+    const HOST_GLOBAL = "https://danmaku-global.myani.org";
+    const HOST_CN = "https://danmaku-cn.myani.org";
+
+    // 定义内部通用请求函数
+    const fetchDanmu = async (hostUrl) => {
+      const targetUrl = `${hostUrl}/v1/danmaku/${realId}`;
+      try {
+        const resp = await httpGet(targetUrl, { headers: this.headers });
+        
+        if (!resp || !resp.data) return null;
+        
+        const body = resp.data;
+        if (body.danmakuList) return body.danmakuList;
+        return null;
+      } catch (error) {
+        log("warn", `[Animeko] 请求节点失败: ${hostUrl} - ${error.message}`);
+        return null;
+      }
+    };
+
+    // 2. 优先尝试 Global 节点
+    let danmuList = await fetchDanmu(HOST_GLOBAL);
+
+    // 3. 如果失败，降级尝试 CN 节点
+    if (!danmuList) {
+      log("info", `[Animeko] Global 节点获取失败/无数据，降级尝试 CN 节点... ID:${realId}`);
+      danmuList = await fetchDanmu(HOST_CN);
+    }
+
+    // 4. 返回结果或空数组
+    if (danmuList) {
+      log("info", `[Animeko] 成功获取弹幕，共 ${danmuList.length} 条`);
+      return danmuList;
+    }
+
+    log("error", "[Animeko] 所有节点尝试均失败，无法获取弹幕");
+    return [];
   }
 
   /**
@@ -431,7 +529,7 @@ export default class AnimekoSource extends BaseSource {
         "type": "animeko",
         "segment_start": 0,
         "segment_end": 30000, 
-        "url": `https://danmaku-global.myani.org/v1/danmaku/${id}` // 使用完整 URL
+        "url": String(id)
       }]
     });
   }
@@ -465,7 +563,7 @@ export default class AnimekoSource extends BaseSource {
         const time = (Number(info.playTime) / 1000).toFixed(2);
         const mode = locationMap[info.location] || 1;
         const color = info.color === -1 ? 16777215 : info.color;
-        const text = globals.danmuSimplified ? simplized(info.text) : info.text;
+        const text = globals.danmuSimplifiedTraditional === 'simplified' ? simplized(info.text) : info.text;
 
         return {
           cid: item.id,
